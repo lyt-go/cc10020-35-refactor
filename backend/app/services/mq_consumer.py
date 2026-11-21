@@ -121,12 +121,13 @@ class MqConsumerService(BaseModuleService):
             # 模拟处理：20%概率失败
             if random.random() < 0.2:
                 failed += 1
-                # 路由到死信队列（跨模块：dlq_handler）
-                dlq_record = self._route_to_dlq(consumer_id, msg, "处理超时" if consumed % 3 == 0 else "数据格式异常")
+                # 路由到死信队列（跨模块：dlq_handler），透传队列偏移作为来源身份
+                reason = "处理超时" if consumed % 3 == 0 else "数据格式异常"
+                dlq_record = self._route_to_dlq(consumer_id, msg, reason)
                 dlq_records.append(dlq_record)
             else:
                 consumed += 1
-                # 记录消费追踪（跨模块：call_trace_log）
+                # 记录消费追踪（跨模块：call_trace_log），携带实际消费凭证上下文
                 self._record_consumption(consumer_id, msg, timeout_ms)
 
         # 提交偏移
@@ -151,7 +152,11 @@ class MqConsumerService(BaseModuleService):
         }
 
     def _route_to_dlq(self, consumer_id: int, message: dict[str, Any], reason: str) -> dict[str, Any]:
-        """将消费失败的消息路由到死信队列。"""
+        """将消费失败的消息路由到死信队列。
+
+        把队列名、偏移、消费者凭证一并透传给死信服务的共用消息身份明细，
+        同一偏移的再次投递与另一来源的同业务键事件据此区分。
+        """
         try:
             from app.services.dlq_handler import DlqHandlerService
             dlq_svc = DlqHandlerService()
@@ -161,22 +166,35 @@ class MqConsumerService(BaseModuleService):
                 original_message=payload_str,
                 failure_reason=reason,
                 consumer_id=consumer_id,
+                source_offset=message.get("offset"),
+                source_kind="queue",
             )
         except Exception as e:
             return {"ok": False, "reason": str(e)}
 
     def _record_consumption(self, consumer_id: int, message: dict[str, Any], latency_ms: int) -> None:
-        """记录消费成功的追踪信息。"""
+        """记录消费成功的追踪信息，并登记实际消费凭证（队列+偏移）。"""
         try:
             from app.services.call_trace_log import CallTraceLogService
             tracer = CallTraceLogService()
-            tracer._record_trace(
+            trace = tracer._record_trace(
                 endpoint_id=consumer_id,
                 action="消息消费",
                 latency_ms=min(latency_ms, 5000),
                 status="正常",
                 record_count=1,
             )
+            # 关联实际受理记录：消费者凭证 + 队列偏移，供死信台账回查
+            if trace.get("ok") and trace.get("record_id") is not None:
+                from app.persistence import json_store
+                json_store.update(tracer.MODULE, trace["record_id"], {
+                    "_consume_context": {
+                        "consumer_id": consumer_id,
+                        "queue": str(message.get("queue", "")),
+                        "source_offset": str(message.get("offset", "")),
+                        "message_id": str(message.get("message_id", "")),
+                    },
+                })
         except Exception:
             pass
 

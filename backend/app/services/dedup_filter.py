@@ -3,18 +3,27 @@
 支持基于事件ID的精确去重、基于内容指纹的模糊去重和
 时间窗口内的重复事件识别。
 跨模块关联：webhook_channel（事件接收去重）、data_lake_sink（存储去重检查）。
+
+重构说明：消息身份取值（去重键列取值、幂等键、内容指纹、来源坐标、原始
+消息数据）统一收拢到 ``app.services.message_identity``，与死信队列管理复用
+同一份消息身份明细；本服务的判重规则、返回结构与缓存语义保持不变。
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
 from typing import Any
 
 from app.persistence import json_store
 from app.services.base import BaseModuleService
+from app.services.message_identity import (
+    MessageIdentity,
+    SOURCE_KIND_UNKNOWN,
+    build_event_identity,
+    build_idempotency_key,
+    compute_content_fingerprint,
+    extract_dedup_key_value,
+)
 
 
 class DedupFilterService(BaseModuleService):
@@ -32,14 +41,22 @@ class DedupFilterService(BaseModuleService):
         self._fingerprint_cache: dict[str, float] = {}
         self._idempotency_keys: set[str] = set()
         self._duplicate_stats: dict[str, int] = defaultdict(int)
+        # 幂等键 → 共用消息身份明细（含来源坐标与原始消息数据）
+        self._identity_registry: dict[str, MessageIdentity] = {}
 
-    def check_duplicate(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def check_duplicate(self, event_type: str, payload: dict[str, Any],
+                        identity: MessageIdentity | None = None) -> dict[str, Any]:
         """检查事件是否重复。
 
         去重策略（按规则优先级）：
         1. 幂等键去重：基于事件唯一标识
         2. 内容指纹去重：基于payload内容哈希
         3. 时间窗口去重：相同类型事件在时间窗口内重复
+
+        Args:
+            identity: 可选的共用消息身份明细。未传入时按事件通用入口构建，
+                判重仍只依据规则配置的去重键列，来源身份仅用于登记明细，
+                不改变既有判重结果。
 
         Returns:
             { ok: bool, is_duplicate: bool, reason: str, dedup_key: str }
@@ -60,13 +77,21 @@ class DedupFilterService(BaseModuleService):
             threshold = float(rule.get("相似度阈值", "0.95") or "0.95")
             conflict_policy = str(rule.get("冲突策略", "跳过"))
 
-            # 构建去重键
+            # 构建去重键（取值逻辑由共用消息身份明细提供，口径不变）
             dedup_key = self._build_dedup_key(event_type, payload, dedup_keys)
 
             if not dedup_key:
                 continue
 
-            # 幂等检查
+            # 归并消息来源身份：判重字段与死信原始消息数据共用同一份明细
+            message_identity = identity or build_event_identity(
+                event_type=event_type,
+                payload=payload,
+                dedup_key_fields=dedup_keys,
+                source_kind=SOURCE_KIND_UNKNOWN,
+            )
+
+            # 幂等检查（仍按原去重键判重）
             if dedup_key in self._idempotency_keys:
                 self._duplicate_stats[event_type] += 1
                 return {
@@ -75,6 +100,7 @@ class DedupFilterService(BaseModuleService):
                     "reason": f"幂等键重复: {dedup_key[:32]}...",
                     "dedup_key": dedup_key,
                     "policy": conflict_policy,
+                    "identity": message_identity.to_dict(),
                 }
 
             # 内容指纹检查
@@ -94,45 +120,32 @@ class DedupFilterService(BaseModuleService):
                                 "dedup_key": dedup_key,
                                 "similarity": similarity,
                                 "policy": conflict_policy,
+                                "identity": message_identity.to_dict(),
                             }
                 self._fingerprint_cache[fp] = now
 
-            # 标记为已处理
+            # 标记为已处理，同时登记共用消息身份明细
             self._idempotency_keys.add(dedup_key)
+            self._identity_registry[dedup_key] = message_identity
 
         return {"ok": True, "is_duplicate": False, "reason": "通过去重检查"}
 
+    def get_message_identity(self, dedup_key: str) -> dict[str, Any] | None:
+        """按幂等键查询已登记的共用消息身份明细。"""
+        identity = self._identity_registry.get(dedup_key)
+        return identity.to_dict() if identity is not None else None
+
     def _build_dedup_key(self, event_type: str, payload: dict[str, Any], key_fields: str) -> str:
-        """构建去重唯一键。
+        """构建去重唯一键（委托共用消息身份模块，支持逗号分隔多键）。"""
+        return build_idempotency_key(event_type, payload, key_fields)
 
-        支持单键和多键组合（逗号分隔）。
-        """
-        if not key_fields:
-            return ""
-
-        parts = []
-        for key in key_fields.split(","):
-            key = key.strip()
-            if key == "id":
-                val = payload.get("id") or payload.get("event_id", "")
-                parts.append(str(val))
-            elif key in payload:
-                parts.append(str(payload[key]))
-            elif f"data.{key}" in str(payload.get("data", {})):
-                parts.append(str(payload.get("data", {}).get(key, "")))
-            else:
-                for dk, dv in payload.items():
-                    if dk == key:
-                        parts.append(str(dv))
-                        break
-
-        parts.insert(0, event_type)
-        return "|".join(parts)
+    def _extract_dedup_key_value(self, payload: dict[str, Any], key_fields: str) -> str:
+        """按去重键列取值（保留原字段口径，供跨模块复用）。"""
+        return extract_dedup_key_value(payload, key_fields)
 
     def _compute_content_fingerprint(self, payload: dict[str, Any]) -> str:
         """计算payload的内容指纹。"""
-        content = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(content.encode()).hexdigest()
+        return compute_content_fingerprint(payload)
 
     def _compute_similarity(self, fp1: str, fp2: str) -> float:
         """计算两个指纹的相似度（基于字符重合度）。"""
@@ -170,6 +183,7 @@ class DedupFilterService(BaseModuleService):
         self._fingerprint_cache.clear()
         self._idempotency_keys.clear()
         self._duplicate_stats.clear()
+        self._identity_registry.clear()
         return {"ok": True, "message": f"去重缓存已清空（历史去重: {total_dup}）"}
 
     def domain_snapshot(self) -> dict[str, Any]:
